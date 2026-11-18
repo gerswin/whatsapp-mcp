@@ -1,0 +1,7 @@
+/data/
+/wa-mcp
+.env
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

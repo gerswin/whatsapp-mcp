@@ -1,0 +1,27 @@
+services:
+  wa-mcp:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: whatsapp-mcp:local
+    container_name: wa-mcp
+    restart: unless-stopped
+    # Only local by default: a tunnel or reverse proxy on this host publishes it.
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-4020}:4020"
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      RETENTION_DAYS: ${RETENTION_DAYS:-0}
+      TZ: ${TZ:-UTC}
+      WHISPER_API_KEY: ${WHISPER_API_KEY:-}
+      WHISPER_BASE_URL: ${WHISPER_BASE_URL:-}
+      WHISPER_MODEL: ${WHISPER_MODEL:-}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
+      WHISPER_AUTO: ${WHISPER_AUTO:-true}
+      WHISPER_MAX_SECONDS: ${WHISPER_MAX_SECONDS:-600}
+    volumes:
+      - wa_mcp_data:/data
+
+volumes:
+  wa_mcp_data:
