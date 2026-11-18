@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -43,7 +44,9 @@ type Options struct {
 	// AutoMaxSeconds long, so they show up in history and search.
 	AutoTranscribe bool
 	AutoMaxSeconds int
-	Log            *slog.Logger
+	// StoreStatus keeps contacts' status updates as a chat of their own.
+	StoreStatus bool
+	Log         *slog.Logger
 }
 
 type Manager struct {
@@ -53,6 +56,7 @@ type Manager struct {
 	transcriber    Transcriber
 	autoEnabled    bool
 	autoMaxSeconds int
+	storeStatus    bool
 	log            *slog.Logger
 
 	mu      sync.RWMutex
@@ -96,7 +100,11 @@ func NewManager(ctx context.Context, opts Options) (*Manager, error) {
 		return nil, fmt.Errorf("migrate WhatsApp session database: %w", err)
 	}
 
-	store.SetOSInfo("WhatsApp MCP", [3]uint32{1, 0, 0})
+	// What the phone shows under "Linked devices": "Google Chrome (Linux)".
+	// Without a platform type WhatsApp lists the session as "Other device".
+	// This is sent when pairing, so it only changes for newly linked devices.
+	store.SetOSInfo("Linux", [3]uint32{1, 0, 0})
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
 
 	return &Manager{
 		store:          opts.Store,
@@ -105,6 +113,7 @@ func NewManager(ctx context.Context, opts Options) (*Manager, error) {
 		transcriber:    opts.Transcriber,
 		autoEnabled:    opts.AutoTranscribe && opts.Transcriber != nil,
 		autoMaxSeconds: opts.AutoMaxSeconds,
+		storeStatus:    opts.StoreStatus,
 		log:            opts.Log,
 		clients:        map[string]*whatsmeow.Client{},
 	}, nil

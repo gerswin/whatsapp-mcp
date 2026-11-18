@@ -1,15 +1,18 @@
 package wa
 
 import (
+	"crypto/sha256"
 	"io"
 	"log/slog"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -91,10 +94,10 @@ func TestConvertSkipsNonChatContent(t *testing.T) {
 	chat := types.NewJID("111", types.DefaultUserServer)
 
 	cases := map[string]*events.Message{
-		"status broadcast": {Info: types.MessageInfo{ID: "1", MessageSource: types.MessageSource{Chat: types.StatusBroadcastJID}}, Message: text},
-		"newsletter":       {Info: types.MessageInfo{ID: "1", MessageSource: types.MessageSource{Chat: types.NewJID("1", types.NewsletterServer)}}, Message: text},
-		"reaction":         {Info: types.MessageInfo{ID: "1", MessageSource: types.MessageSource{Chat: chat}}, Message: &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Text: proto.String("👍")}}},
-		"missing id":       {Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat}}, Message: text},
+		"broadcast list": {Info: types.MessageInfo{ID: "1", MessageSource: types.MessageSource{Chat: types.NewJID("123", types.BroadcastServer)}}, Message: text},
+		"newsletter":     {Info: types.MessageInfo{ID: "1", MessageSource: types.MessageSource{Chat: types.NewJID("1", types.NewsletterServer)}}, Message: text},
+		"reaction":       {Info: types.MessageInfo{ID: "1", MessageSource: types.MessageSource{Chat: chat}}, Message: &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Text: proto.String("👍")}}},
+		"missing id":     {Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat}}, Message: text},
 	}
 	for name, evt := range cases {
 		if _, ok := convert(nil, evt); ok {
@@ -161,6 +164,116 @@ func TestIsPublicIP(t *testing.T) {
 	} {
 		if got := isPublicIP(net.ParseIP(ip)); got != want {
 			t.Errorf("isPublicIP(%s) = %v, want %v", ip, got, want)
+		}
+	}
+}
+
+func TestCaptureReactionsAndPollVotes(t *testing.T) {
+	mgr := newManager(t)
+	s := mgr.store
+
+	group := types.NewJID("120363000000000001", types.GroupServer)
+	ana := types.NewJID("573001111111", types.DefaultUserServer)
+	luis := types.NewJID("573002222222", types.DefaultUserServer)
+	from := func(sender types.JID, id string, minute int) types.MessageInfo {
+		return types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: group, Sender: sender, IsGroup: true},
+			ID:            id, Timestamp: at(minute),
+		}
+	}
+	target := func(id string) *waCommon.MessageKey { return &waCommon.MessageKey{ID: proto.String(id)} }
+
+	mgr.captureMessage(nil, "inst", &events.Message{Info: from(ana, "p1", 1), Message: &waE2E.Message{
+		PollCreationMessage: &waE2E.PollCreationMessage{
+			Name: proto.String("¿Qué día?"),
+			Options: []*waE2E.PollCreationMessage_Option{
+				{OptionName: proto.String("Lunes")}, {OptionName: proto.String("Martes")},
+			},
+		},
+	}}, true)
+
+	react := func(sender types.JID, id, emoji string, minute int) {
+		mgr.captureMessage(nil, "inst", &events.Message{Info: from(sender, id, minute), Message: &waE2E.Message{
+			ReactionMessage: &waE2E.ReactionMessage{Key: target("p1"), Text: proto.String(emoji)},
+		}}, true)
+	}
+	react(ana, "r1", "👍", 2)
+	react(luis, "r2", "🔥", 3)
+	react(ana, "r3", "", 4) // removed
+
+	// Votes carry the SHA-256 of the chosen option names.
+	hash := func(option string) []byte { h := sha256.Sum256([]byte(option)); return h[:] }
+	mgr.savePollVote("inst", group.String(), "p1", luis.String(), false, [][]byte{hash("Martes"), hash("not an option")}, at(5))
+	mgr.savePollVote("inst", group.String(), "missing", luis.String(), false, [][]byte{hash("Martes")}, at(5))
+
+	// History sync delivers reactions and votes attached to the message.
+	poll, _ := s.Get("inst", group.String(), "p1")
+	mgr.captureHistoryExtras(nil, "inst", *poll, &waWeb.WebMessageInfo{
+		Reactions: []*waWeb.Reaction{{
+			Key:  &waCommon.MessageKey{Participant: proto.String(ana.String())},
+			Text: proto.String("😮"), SenderTimestampMS: proto.Int64(at(6).UnixMilli()),
+		}},
+		PollUpdates: []*waWeb.PollUpdate{{
+			PollUpdateMessageKey: &waCommon.MessageKey{FromMe: proto.Bool(true)},
+			Vote:                 &waE2E.PollVoteMessage{SelectedOptions: [][]byte{hash("Lunes")}},
+			SenderTimestampMS:    proto.Int64(at(7).UnixMilli()),
+		}},
+	})
+
+	msgs, _ := s.Messages("inst", group.String(), time.Time{}, 10)
+	if len(msgs) != 1 {
+		t.Fatalf("reactions and votes must not be stored as messages: %+v", msgs)
+	}
+	if err := s.Annotate("inst", msgs); err != nil {
+		t.Fatalf("Annotate: %v", err)
+	}
+	got := msgs[0]
+
+	if len(got.Reactions) != 2 || got.Reactions[0].SenderJID != luis.String() || got.Reactions[0].Emoji != "🔥" ||
+		got.Reactions[1].SenderJID != ana.String() || got.Reactions[1].Emoji != "😮" {
+		t.Fatalf("unexpected reactions: %+v", got.Reactions)
+	}
+	if len(got.Votes) != 2 || got.Votes[0].VoterJID != luis.String() || len(got.Votes[0].Options) != 1 || got.Votes[0].Options[0] != "Martes" ||
+		!got.Votes[1].FromMe || got.Votes[1].Options[0] != "Lunes" {
+		t.Fatalf("unexpected votes: %+v", got.Votes)
+	}
+}
+
+func TestStatusUpdatesAreOptIn(t *testing.T) {
+	ana := types.NewJID("573001111111", types.DefaultUserServer)
+	status := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: types.StatusBroadcastJID, Sender: ana},
+			ID:            "s1", PushName: "Ana", Timestamp: at(1),
+		},
+		Message: &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("de viaje")}},
+	}
+	chat := types.StatusBroadcastJID.String()
+
+	off := newManager(t)
+	off.captureMessage(nil, "inst", status, true)
+	if m, _ := off.store.Get("inst", chat, "s1"); m != nil {
+		t.Fatalf("status stored although STORE_STATUS is off: %+v", m)
+	}
+
+	on := newManager(t)
+	on.storeStatus = true
+	on.captureMessage(nil, "inst", status, true)
+	m, _ := on.store.Get("inst", chat, "s1")
+	if m == nil || m.Text != "de viaje" || m.SenderJID != ana.String() || m.SenderName != "Ana" {
+		t.Fatalf("status not stored: %+v", m)
+	}
+	// All statuses share one chat; it must not take the name of a poster.
+	if name := on.store.ChatName("inst", chat); name != statusChatName {
+		t.Fatalf("status chat name = %q", name)
+	}
+}
+
+func TestSendingIsLimitedToPeopleAndGroups(t *testing.T) {
+	mgr := newManager(t)
+	for _, to := range []string{"status@broadcast", "120363000000000009@newsletter", "123@broadcast"} {
+		if _, err := mgr.SendText(t.Context(), "inst", to, "hola", ""); err == nil || !strings.Contains(err.Error(), "only be sent to people and groups") {
+			t.Errorf("SendText(%q) = %v, want a refusal", to, err)
 		}
 	}
 }

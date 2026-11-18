@@ -21,6 +21,9 @@ import (
 
 const Path = "/mcp"
 
+// statusChat is the chat that holds contacts' status updates, when kept.
+const statusChat = "status@broadcast"
+
 // Backend is the WhatsApp side of the tools; *wa.Manager implements it.
 type Backend interface {
 	Status(account string) wa.AccountStatus
@@ -36,6 +39,8 @@ type Backend interface {
 	React(ctx context.Context, account, chat, messageID, emoji string, fromMe *bool) error
 	MarkRead(ctx context.Context, account, chat string, messageIDs []string) error
 	Media(ctx context.Context, account, chat, messageID string) (*wa.Media, error)
+	Channels(ctx context.Context, account string) ([]wa.Channel, error)
+	ChannelMessages(ctx context.Context, account, channel string, limit, before int) ([]wa.ChannelMessage, error)
 }
 
 type Config struct {
@@ -50,6 +55,8 @@ type Config struct {
 	Version   string
 	// Transcription tells the assistant whether audio can be transcribed.
 	Transcription bool
+	// StatusUpdates tells the assistant that status updates are being kept.
+	StatusUpdates bool
 }
 
 type accountKey struct{}
@@ -136,11 +143,16 @@ func (e *endpoint) newServer(account string, schemas *mcp.SchemaCache) *mcp.Serv
 		"or a WhatsApp JID (…@s.whatsapp.net for people, …@g.us for groups); prefer the JIDs returned by list_chats. " +
 		"Sending tools deliver real messages to real people: confirm the recipient and content with the user before sending. " +
 		"Chat history covers messages received or sent since the account was linked, plus what WhatsApp synced at that moment. " +
+		"Messages carry their reactions, and polls their current results. " +
+		"Channels the account follows are not part of the chat history: read them with list_channels and get_channel_messages. " +
 		"Messages with has_media can be opened with get_media: images and stickers are returned as pictures"
 	if e.Transcription {
 		instructions += ", voice notes, audio and video as a transcript. The text of a voice note or audio message, when present, is its automatic transcript and may contain recognition mistakes."
 	} else {
 		instructions += ". Audio transcription is not configured on this server, so voice notes cannot be read."
+	}
+	if e.StatusUpdates {
+		instructions += " Status updates posted by contacts are kept in the chat \"" + statusChat + "\"; they are not conversations and cannot be replied to from here."
 	}
 
 	server := mcp.NewServer(&mcp.Implementation{

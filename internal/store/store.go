@@ -5,6 +5,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +34,12 @@ type Message struct {
 	// Media is only used when saving: the serialized media part of the
 	// WhatsApp message. It is never loaded by the listing queries.
 	Media []byte
+	// PollOptions are the option names of a poll, in order. Set them when
+	// saving a poll; when reading they are filled in by Store.Annotate, like
+	// Reactions and Votes.
+	PollOptions []string
+	Reactions   []Reaction
+	Votes       []PollVote
 }
 
 // Chat summarizes one conversation.
@@ -98,7 +105,7 @@ func Open(path string) (*Store, error) {
 	// One writer at a time; WAL keeps this cheap and avoids SQLITE_BUSY.
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + extrasSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate message store: %w", err)
 	}
@@ -139,6 +146,16 @@ func (s *Store) Save(account string, msgs ...Message) error {
 		if _, err := stmt.Exec(account, m.ChatJID, m.ID, m.SenderJID, m.SenderName, m.FromMe, m.Type, m.Text, m.QuotedID, m.Timestamp.Unix(), nullable(m.Media)); err != nil {
 			return err
 		}
+		if len(m.PollOptions) > 0 {
+			options, err := json.Marshal(m.PollOptions)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT INTO polls (account, chat_jid, message_id, options) VALUES (?, ?, ?, ?)
+				ON CONFLICT (account, chat_jid, message_id) DO NOTHING`, account, m.ChatJID, m.ID, string(options)); err != nil {
+				return err
+			}
+		}
 	}
 
 	return tx.Commit()
@@ -161,9 +178,11 @@ func (s *Store) SetTranscript(account, chatJID, messageID, text string) error {
 
 // MarkDeleted flags a message as deleted for everyone and drops its content.
 func (s *Store) MarkDeleted(account, chatJID, messageID string) error {
-	_, err := s.db.Exec(`UPDATE messages SET deleted = 1, text = '', media = NULL WHERE account = ? AND chat_jid = ? AND message_id = ?`,
-		account, chatJID, messageID)
-	return err
+	if _, err := s.db.Exec(`UPDATE messages SET deleted = 1, text = '', media = NULL WHERE account = ? AND chat_jid = ? AND message_id = ?`,
+		account, chatJID, messageID); err != nil {
+		return err
+	}
+	return s.dropExtras(account, chatJID, messageID)
 }
 
 // SetChatName records a display name for a chat. Empty names are ignored.
@@ -271,11 +290,12 @@ func (s *Store) Get(account, chatJID, messageID string) (*Message, error) {
 
 // PurgeAccount removes everything stored for an account.
 func (s *Store) PurgeAccount(account string) error {
-	if _, err := s.db.Exec(`DELETE FROM messages WHERE account = ?`, account); err != nil {
-		return err
+	for _, table := range append([]string{"messages", "chats"}, extraTables...) {
+		if _, err := s.db.Exec(`DELETE FROM `+table+` WHERE account = ?`, account); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.Exec(`DELETE FROM chats WHERE account = ?`, account)
-	return err
+	return nil
 }
 
 // Prune deletes messages older than cutoff and returns how many were removed.
@@ -284,7 +304,13 @@ func (s *Store) Prune(cutoff time.Time) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if err := s.dropOrphanExtras(); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 const messageColumns = `message_id, chat_jid, sender_jid, sender_name, from_me, type, text, quoted_id, timestamp, deleted, media IS NOT NULL`

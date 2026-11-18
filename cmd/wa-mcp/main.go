@@ -53,6 +53,7 @@ Configuration (environment):
   WHISPER_MODEL         transcription model (default whisper-1)
   WHISPER_LANGUAGE      language hint such as "es" (default: auto-detect)
   WHISPER_AUTO          transcribe incoming audio automatically (default true)
+  STORE_STATUS          keep contacts' status updates as a chat (default false)
   WHISPER_MAX_SECONDS   longest audio to transcribe automatically (default 600)
 `
 
@@ -126,6 +127,7 @@ func serve() error {
 		transcriber = media.NewWhisper(env("WHISPER_BASE_URL", ""), key, env("WHISPER_MODEL", ""), env("WHISPER_LANGUAGE", ""))
 	}
 	auto := transcriber != nil && !strings.EqualFold(env("WHISPER_AUTO", "true"), "false")
+	storeStatus := strings.EqualFold(env("STORE_STATUS", "false"), "true")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -136,6 +138,7 @@ func serve() error {
 		Transcriber:    transcriber,
 		AutoTranscribe: auto,
 		AutoMaxSeconds: envInt("WHISPER_MAX_SECONDS", 600),
+		StoreStatus:    storeStatus,
 		Log:            log,
 	})
 	if err != nil {
@@ -160,6 +163,7 @@ func serve() error {
 		PublicURL:     env("PUBLIC_URL", ""),
 		Version:       version,
 		Transcription: transcriber != nil,
+		StatusUpdates: storeStatus,
 	})
 	if err != nil {
 		return fmt.Errorf("start MCP server: %w", err)
@@ -202,7 +206,7 @@ func serve() error {
 			transcription = "automatic"
 		}
 	}
-	log.Info("wa-mcp is running", "version", version, "listen", addr, "mcp", mcpserver.Path, "data", dir, "transcription", transcription)
+	log.Info("wa-mcp is running", "version", version, "listen", addr, "mcp", mcpserver.Path, "data", dir, "transcription", transcription, "status_updates", storeStatus)
 
 	select {
 	case err := <-failed:

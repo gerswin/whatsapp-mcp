@@ -70,13 +70,15 @@ ingress:
 |---|---|
 | `get_status` | Estado de conexión y número vinculado |
 | `list_chats` | Chats por actividad reciente, con vista previa |
-| `get_messages` | Mensajes de un chat, paginable hacia atrás |
+| `get_messages` | Mensajes de un chat, paginable hacia atrás, con sus reacciones y los resultados de las encuestas |
 | `search_messages` | Búsqueda de texto, incluidas las transcripciones |
 | `get_media` | Abre el archivo de un mensaje: imagen o sticker como imagen; audio, nota de voz o video como transcripción; documentos de texto como texto |
 | `list_contacts` | Contactos de la agenda |
 | `check_numbers` | Verifica qué números tienen WhatsApp |
 | `list_groups` | Grupos de la cuenta |
 | `get_group_info` | Nombre, descripción y participantes de un grupo |
+| `list_channels` | Canales que sigue la cuenta |
+| `get_channel_messages` | Publicaciones de un canal, consultadas a WhatsApp en el momento |
 | `send_text` | Envía texto, opcionalmente citando un mensaje |
 | `send_media` | Envía imagen, video, audio o documento desde una URL pública |
 | `send_location` | Envía una ubicación |
@@ -109,13 +111,18 @@ La transcripción envía el audio al servicio configurado (por defecto, OpenAI).
 | `WHISPER_LANGUAGE` | autodetectar | Pista de idioma, p. ej. `es` |
 | `WHISPER_AUTO` | `true` | Transcribir al llegar |
 | `WHISPER_MAX_SECONDS` | `600` | Duración máxima para la transcripción automática |
+| `STORE_STATUS` | `false` | Guarda los estados de tus contactos como un chat aparte |
 
 ## Qué se guarda y qué no
 
 En `DATA_DIR` quedan tres archivos SQLite: `whatsapp.db` (la sesión de WhatsApp), `messages.db` (cuentas y mensajes) y `oauth.db` (clientes OAuth y hashes de tokens).
 
 - Se guarda el texto de mensajes recibidos y enviados, el historial que WhatsApp sincroniza al vincular, y las ediciones y eliminaciones "para todos".
-- No se guardan estados, canales, reacciones ni votos de encuestas.
+- **Reacciones**: se guarda la reacción vigente de cada persona en cada mensaje.
+- **Votos de encuestas**: se guarda el voto vigente de cada persona. Los votos llegan cifrados con una clave que viaja con la encuesta, así que los de encuestas anteriores a la vinculación pueden no poder leerse.
+- **Estados**: no se guardan salvo con `STORE_STATUS=true`. En ese caso aparecen en el chat `status@broadcast` ("Status updates") y entran en la búsqueda. Sus fotos y videos solo se pueden abrir mientras WhatsApp los conserva (unas 24 horas).
+- **Canales**: no se capturan al llegar. `get_channel_messages` los consulta a WhatsApp cuando el asistente los pide, y lo que se haya consultado queda guardado para poder abrir sus archivos y buscarlo.
+- Las tools de envío solo escriben a personas y grupos: no publican estados ni en canales.
 - Los tokens de cuenta y de OAuth se guardan solo como hash.
 
 `messages.db` contiene conversaciones privadas en texto plano y `whatsapp.db` permite actuar como tu cuenta: protege ese directorio y sus copias de seguridad. Las tools de envío entregan mensajes reales.

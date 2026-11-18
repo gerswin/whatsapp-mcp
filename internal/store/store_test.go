@@ -121,3 +121,69 @@ func TestStoreSearchEditDeletePurge(t *testing.T) {
 		t.Fatalf("purge left chats behind: %+v", chats)
 	}
 }
+
+func TestReactionsAndPollVotes(t *testing.T) {
+	s := newStore(t)
+	const chat, ana, luis = "999@g.us", "111@s.whatsapp.net", "222@s.whatsapp.net"
+
+	if err := s.Save("inst",
+		Message{ID: "t1", ChatJID: chat, Type: "text", Text: "hola", Timestamp: at(1)},
+		Message{ID: "p1", ChatJID: chat, Type: "poll", Text: "¿Día?", Timestamp: at(2), PollOptions: []string{"Lunes", "Martes"}},
+	); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	load := func() (text, poll Message) {
+		t.Helper()
+		msgs, err := s.Messages("inst", chat, time.Time{}, 10)
+		if err != nil || len(msgs) != 2 {
+			t.Fatalf("Messages: %v (%d)", err, len(msgs))
+		}
+		if err := s.Annotate("inst", msgs); err != nil {
+			t.Fatalf("Annotate: %v", err)
+		}
+		return msgs[0], msgs[1]
+	}
+
+	_ = s.SetReaction("inst", chat, "t1", ana, false, "👍", at(3))
+	_ = s.SetReaction("inst", chat, "t1", luis, false, "❤️", at(4))
+	_ = s.SetReaction("inst", chat, "t1", ana, false, "😂", at(5))   // ana changes hers
+	_ = s.SetReaction("inst", chat, "t1", luis, false, "", at(6))   // luis removes his
+	_ = s.SetReaction("inst", chat, "t1", luis, false, "❤️", at(4)) // stale replay must not undo the removal
+
+	text, poll := load()
+	if len(text.Reactions) != 1 || text.Reactions[0].SenderJID != ana || text.Reactions[0].Emoji != "😂" {
+		t.Fatalf("unexpected reactions: %+v", text.Reactions)
+	}
+	if len(poll.Reactions) != 0 || len(poll.PollOptions) != 2 || poll.PollOptions[1] != "Martes" {
+		t.Fatalf("unexpected poll: %+v", poll)
+	}
+	if got := s.PollOptions("inst", chat, "p1"); len(got) != 2 || got[0] != "Lunes" {
+		t.Fatalf("PollOptions = %v", got)
+	}
+
+	_ = s.SetPollVote("inst", chat, "p1", ana, false, []string{"Lunes"}, at(3))
+	_ = s.SetPollVote("inst", chat, "p1", luis, false, []string{"Lunes", "Martes"}, at(4))
+	_ = s.SetPollVote("inst", chat, "p1", ana, false, []string{"Martes"}, at(5)) // ana changes her vote
+	_ = s.SetPollVote("inst", chat, "p1", luis, false, nil, at(6))               // luis withdraws
+
+	if _, poll = load(); len(poll.Votes) != 1 || poll.Votes[0].VoterJID != ana || len(poll.Votes[0].Options) != 1 || poll.Votes[0].Options[0] != "Martes" {
+		t.Fatalf("unexpected votes: %+v", poll.Votes)
+	}
+
+	// Deleting a message for everyone takes its reactions with it.
+	if err := s.MarkDeleted("inst", chat, "t1"); err != nil {
+		t.Fatalf("MarkDeleted: %v", err)
+	}
+	if text, _ = load(); len(text.Reactions) != 0 {
+		t.Fatalf("reactions survived the delete: %+v", text.Reactions)
+	}
+
+	// Pruning a poll takes its options and votes with it.
+	if n, err := s.Prune(at(10)); err != nil || n != 2 {
+		t.Fatalf("Prune removed %d (err %v), want 2", n, err)
+	}
+	if got := s.PollOptions("inst", chat, "p1"); got != nil {
+		t.Fatalf("poll options survived the prune: %v", got)
+	}
+}

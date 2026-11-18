@@ -44,6 +44,12 @@ func (m *Manager) target(account, to string) (*whatsmeow.Client, types.JID, erro
 	if err != nil {
 		return nil, types.JID{}, err
 	}
+	switch jid.Server {
+	case types.DefaultUserServer, types.GroupServer, types.HiddenUserServer:
+	default:
+		// Never post a status or to a channel on the user's behalf.
+		return nil, types.JID{}, errors.New("messages can only be sent to people and groups, not to status updates or channels")
+	}
 	client, err := m.ready(account)
 	if err != nil {
 		return nil, types.JID{}, err
@@ -229,9 +235,13 @@ func (m *Manager) React(ctx context.Context, account, chat, messageID, emoji str
 		}
 	}
 
-	// Reactions are not stored, so this bypasses deliver.
-	if _, err := client.SendMessage(ctx, jid, client.BuildReaction(jid, sender, messageID, emoji)); err != nil {
+	// A reaction is not a message of its own, so this bypasses deliver.
+	resp, err := client.SendMessage(ctx, jid, client.BuildReaction(jid, sender, messageID, emoji))
+	if err != nil {
 		return fmt.Errorf("WhatsApp did not accept the reaction: %w", err)
+	}
+	if err := m.store.SetReaction(account, jid.String(), messageID, own.String(), true, emoji, timeOrNow(resp.Timestamp)); err != nil {
+		m.log.Error("failed to save reaction", "account", account, "err", err)
 	}
 	return nil
 }

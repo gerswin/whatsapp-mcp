@@ -68,6 +68,22 @@ func (*fakeBackend) Media(_ context.Context, account, chat, id string) (*wa.Medi
 	return nil, errors.New("that message is not in the stored history of this chat")
 }
 
+const channel = "120363000000000009@newsletter"
+
+func (*fakeBackend) Channels(context.Context, string) ([]wa.Channel, error) {
+	return []wa.Channel{{JID: channel, Name: "Noticias", Subscribers: 1200, Role: "subscriber", Verified: true}}, nil
+}
+
+func (*fakeBackend) ChannelMessages(_ context.Context, _, jid string, limit, before int) ([]wa.ChannelMessage, error) {
+	if jid != channel {
+		return nil, errors.New("channel must be a channel JID ending in @newsletter (see list_channels)")
+	}
+	return []wa.ChannelMessage{
+		{ID: 41, Type: "text", Text: "Abrimos el lunes", Views: 300, Reactions: map[string]int{"👍": 12}, Timestamp: time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)},
+		{ID: 42, Type: "image", Text: "Nuevo local", HasMedia: true, Timestamp: time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)},
+	}, nil
+}
+
 type headerTransport struct {
 	header, value string
 }
@@ -326,6 +342,7 @@ func TestToolList(t *testing.T) {
 	want := []string{
 		"get_status", "list_chats", "get_messages", "search_messages", "get_media",
 		"list_contacts", "check_numbers", "list_groups", "get_group_info",
+		"list_channels", "get_channel_messages",
 		"send_text", "send_media", "send_location", "send_poll", "react_to_message", "mark_read",
 	}
 	for _, name := range want {
@@ -344,5 +361,72 @@ func TestToolList(t *testing.T) {
 	}
 	if a := tools["send_text"].Annotations; a == nil || a.ReadOnlyHint || a.DestructiveHint == nil || *a.DestructiveHint {
 		t.Errorf("send_text should be a non-destructive write: %+v", a)
+	}
+}
+
+func TestReactionsAndPollResults(t *testing.T) {
+	st := seededStore(t)
+	const group, bob = "120363000000000001@g.us", "5511977776666@s.whatsapp.net"
+	when := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+
+	if err := st.Save("inst-a", store.Message{
+		ID: "poll", ChatJID: group, SenderJID: alice, Type: "poll", Text: "¿Día? — Lunes | Martes",
+		Timestamp: when, PollOptions: []string{"Lunes", "Martes"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_ = st.SetReaction("inst-a", alice, "m1", "me", true, "👍", when)
+	_ = st.SetPollVote("inst-a", group, "poll", bob, false, []string{"Martes"}, when)
+	_ = st.SetPollVote("inst-a", group, "poll", "me", true, []string{"Martes"}, when.Add(time.Second))
+	// Another account's reaction on the same ids must never leak.
+	_ = st.SetReaction("inst-b", alice, "m1", bob, false, "💩", when)
+
+	srv, _ := startServer(t, st)
+	session := connect(t, srv, "apikey", tokenA)
+
+	var chat getMessagesOutput
+	call(t, session, "get_messages", map[string]any{"chat": alice}, &chat)
+	var m1 *messageOutput
+	for i := range chat.Messages {
+		if chat.Messages[i].ID == "m1" {
+			m1 = &chat.Messages[i]
+		}
+	}
+	if m1 == nil || len(m1.Reactions) != 1 || m1.Reactions[0].Emoji != "👍" || !m1.Reactions[0].FromMe {
+		t.Fatalf("unexpected reactions on m1: %+v", m1)
+	}
+
+	var polls getMessagesOutput
+	call(t, session, "get_messages", map[string]any{"chat": group}, &polls)
+	if len(polls.Messages) != 1 {
+		t.Fatalf("expected the poll, got %+v", polls.Messages)
+	}
+	results := polls.Messages[0].PollResults
+	if len(results) != 2 || results[0].Option != "Lunes" || results[0].Votes != 0 ||
+		results[1].Option != "Martes" || results[1].Votes != 2 || len(results[1].Voters) != 2 ||
+		results[1].Voters[0].JID != bob || !results[1].Voters[1].FromMe {
+		t.Fatalf("unexpected poll results: %+v", results)
+	}
+}
+
+func TestChannels(t *testing.T) {
+	srv, _ := startServer(t, nil)
+	session := connect(t, srv, "apikey", tokenA)
+
+	var list listChannelsOutput
+	call(t, session, "list_channels", map[string]any{}, &list)
+	if len(list.Channels) != 1 || list.Channels[0].JID != channel || list.Channels[0].Name != "Noticias" || !list.Channels[0].Verified {
+		t.Fatalf("unexpected channels: %+v", list.Channels)
+	}
+
+	var posts getChannelMessagesOutput
+	call(t, session, "get_channel_messages", map[string]any{"channel": channel}, &posts)
+	if len(posts.Messages) != 2 || posts.Messages[0].ID != "41" || posts.Messages[0].Reactions["👍"] != 12 ||
+		posts.Messages[1].ID != "42" || !posts.Messages[1].HasMedia {
+		t.Fatalf("unexpected posts: %+v", posts.Messages)
+	}
+
+	if res := call(t, session, "get_channel_messages", map[string]any{"channel": alice}, nil); !res.IsError {
+		t.Fatalf("a chat JID must not be accepted as a channel")
 	}
 }

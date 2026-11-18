@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,7 +31,7 @@ func (t *tools) register(s *mcp.Server) {
 		"List conversations ordered by most recent activity, with a preview of the last message. Use it to find a chat's JID.",
 		readOnly, t.listChats)
 	addTool(s, "get_messages", "Read chat messages",
-		"Read the messages of one chat, oldest first. Returns the most recent messages by default; pass 'before' to page further back.",
+		"Read the messages of one chat, oldest first, with their reactions and, for polls, the current results. Returns the most recent messages by default; pass 'before' to page further back.",
 		readOnly, t.getMessages)
 	addTool(s, "search_messages", "Search messages",
 		"Find messages containing a text fragment (case-insensitive), across all chats or within one chat. Transcripts of voice notes are searched too. Newest first.",
@@ -49,6 +50,12 @@ func (t *tools) register(s *mcp.Server) {
 	addTool(s, "get_group_info", "Group details",
 		"Get a group's name, description and participants.",
 		readOnly, t.getGroupInfo)
+	addTool(s, "list_channels", "List channels",
+		"List the WhatsApp channels this account follows.",
+		readOnly, t.listChannels)
+	addTool(s, "get_channel_messages", "Read channel posts",
+		"Read the posts of a channel, oldest first, fetched from WhatsApp at this moment. Returns the most recent posts by default; pass 'before' to page further back. Posts with has_media can be opened with get_media, using the channel JID as chat.",
+		readOnly, t.getChannelMessages)
 
 	addTool(s, "send_text", "Send text message",
 		"Send a text message to a person or group. Optionally reply to (quote) a previous message.",
@@ -179,6 +186,26 @@ type messageOutput struct {
 	HasMedia   bool   `json:"has_media,omitempty" jsonschema:"the file of this message can be opened with get_media"`
 	QuotedID   string `json:"quoted_id,omitempty" jsonschema:"id of the message this one replies to"`
 	Deleted    bool   `json:"deleted,omitempty" jsonschema:"the sender deleted this message for everyone"`
+
+	Reactions   []reactionOutput   `json:"reactions,omitempty" jsonschema:"emoji reactions currently on this message"`
+	PollResults []pollOptionOutput `json:"poll_results,omitempty" jsonschema:"for polls: every option with the votes known so far"`
+}
+
+type personOutput struct {
+	FromMe bool   `json:"from_me,omitempty" jsonschema:"true if it is this account"`
+	JID    string `json:"jid,omitempty"`
+	Name   string `json:"name,omitempty"`
+}
+
+type reactionOutput struct {
+	Emoji string `json:"emoji"`
+	personOutput
+}
+
+type pollOptionOutput struct {
+	Option string         `json:"option"`
+	Votes  int            `json:"votes"`
+	Voters []personOutput `json:"voters,omitempty"`
 }
 
 type getMessagesInput struct {
@@ -210,6 +237,10 @@ func (t *tools) getMessages(ctx context.Context, in getMessagesInput) (getMessag
 	if err != nil {
 		return getMessagesOutput{}, err
 	}
+	if err := t.store.Annotate(t.account, msgs); err != nil {
+		return getMessagesOutput{}, err
+	}
+	people := t.people(ctx)
 
 	out := getMessagesOutput{
 		Chat:     chat,
@@ -217,7 +248,7 @@ func (t *tools) getMessages(ctx context.Context, in getMessagesInput) (getMessag
 		Messages: make([]messageOutput, 0, len(msgs)),
 	}
 	for _, m := range msgs {
-		out.Messages = append(out.Messages, toMessageOutput(m, false))
+		out.Messages = append(out.Messages, toMessageOutput(m, false, people))
 	}
 	return out, nil
 }
@@ -250,6 +281,10 @@ func (t *tools) searchMessages(ctx context.Context, in searchMessagesInput) (sea
 	if err != nil {
 		return searchMessagesOutput{}, err
 	}
+	if err := t.store.Annotate(t.account, msgs); err != nil {
+		return searchMessagesOutput{}, err
+	}
+	people := t.people(ctx)
 
 	names := map[string]string{}
 	out := searchMessagesOutput{Messages: make([]messageOutput, 0, len(msgs))}
@@ -259,14 +294,35 @@ func (t *tools) searchMessages(ctx context.Context, in searchMessagesInput) (sea
 			name = t.chatName(ctx, m.ChatJID, t.store.ChatName(t.account, m.ChatJID))
 			names[m.ChatJID] = name
 		}
-		mo := toMessageOutput(m, true)
+		mo := toMessageOutput(m, true, people)
 		mo.ChatName = name
 		out.Messages = append(out.Messages, mo)
 	}
 	return out, nil
 }
 
-func toMessageOutput(m store.Message, withChat bool) messageOutput {
+// people returns a lookup from JID to address-book name that remembers its
+// answers, so a page of messages asks about each person once.
+func (t *tools) people(ctx context.Context) func(jid string) string {
+	names := map[string]string{}
+	return func(jid string) string {
+		name, ok := names[jid]
+		if !ok {
+			name = t.ContactName(ctx, t.account, jid)
+			names[jid] = name
+		}
+		return name
+	}
+}
+
+func person(jid string, fromMe bool, name func(string) string) personOutput {
+	if fromMe {
+		return personOutput{FromMe: true}
+	}
+	return personOutput{JID: jid, Name: name(jid)}
+}
+
+func toMessageOutput(m store.Message, withChat bool, name func(string) string) messageOutput {
 	out := messageOutput{
 		ID:        m.ID,
 		Timestamp: m.Timestamp.Format(time.RFC3339),
@@ -280,9 +336,25 @@ func toMessageOutput(m store.Message, withChat bool) messageOutput {
 	if withChat {
 		out.Chat = m.ChatJID
 	}
-	if !m.FromMe {
+	if !m.FromMe && m.SenderJID != "" {
 		out.Sender = m.SenderJID
-		out.SenderName = m.SenderName
+		out.SenderName = firstNonEmpty(name(m.SenderJID), m.SenderName)
+	}
+
+	for _, r := range m.Reactions {
+		out.Reactions = append(out.Reactions, reactionOutput{Emoji: r.Emoji, personOutput: person(r.SenderJID, r.FromMe, name)})
+	}
+	for _, option := range m.PollOptions {
+		result := pollOptionOutput{Option: option}
+		for _, v := range m.Votes {
+			for _, chosen := range v.Options {
+				if chosen == option {
+					result.Votes++
+					result.Voters = append(result.Voters, person(v.VoterJID, v.FromMe, name))
+				}
+			}
+		}
+		out.PollResults = append(out.PollResults, result)
 	}
 	return out
 }
@@ -493,6 +565,86 @@ func (t *tools) getGroupInfo(ctx context.Context, in getGroupInfoInput) (getGrou
 	}
 	for _, p := range g.Participants {
 		out.Participants = append(out.Participants, groupParticipant{JID: p.JID, Phone: p.Phone, IsAdmin: p.IsAdmin})
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------- channels
+
+type channelOutput struct {
+	JID         string `json:"jid"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Subscribers int    `json:"subscribers"`
+	Verified    bool   `json:"verified,omitempty"`
+	Role        string `json:"role,omitempty" jsonschema:"this account's role: subscriber, admin or owner"`
+}
+
+type listChannelsOutput struct {
+	Channels []channelOutput `json:"channels"`
+}
+
+func (t *tools) listChannels(ctx context.Context, _ struct{}) (listChannelsOutput, error) {
+	channels, err := t.Channels(ctx, t.account)
+	if err != nil {
+		return listChannelsOutput{}, err
+	}
+
+	out := listChannelsOutput{Channels: make([]channelOutput, 0, len(channels))}
+	for _, c := range channels {
+		out.Channels = append(out.Channels, channelOutput{
+			JID: c.JID, Name: c.Name, Description: truncate(c.Description, 300),
+			Subscribers: c.Subscribers, Verified: c.Verified, Role: c.Role,
+		})
+	}
+	sort.Slice(out.Channels, func(i, j int) bool {
+		return strings.ToLower(out.Channels[i].Name) < strings.ToLower(out.Channels[j].Name)
+	})
+	return out, nil
+}
+
+type getChannelMessagesInput struct {
+	Channel string `json:"channel" jsonschema:"channel JID (ends in @newsletter), from list_channels"`
+	Limit   int    `json:"limit,omitempty" jsonschema:"maximum posts to return (default 20, max 100)"`
+	Before  int    `json:"before,omitempty" jsonschema:"only posts older than this post id; use the smallest id of the previous page to go further back"`
+}
+
+type channelMessageOutput struct {
+	ID        string         `json:"id" jsonschema:"post id; also the message_id for get_media"`
+	Timestamp string         `json:"timestamp" jsonschema:"RFC 3339 timestamp"`
+	Type      string         `json:"type"`
+	Text      string         `json:"text,omitempty"`
+	HasMedia  bool           `json:"has_media,omitempty" jsonschema:"the file of this post can be opened with get_media"`
+	Views     int            `json:"views,omitempty"`
+	Reactions map[string]int `json:"reactions,omitempty" jsonschema:"number of reactions per emoji"`
+}
+
+type getChannelMessagesOutput struct {
+	Channel  string                 `json:"channel"`
+	Messages []channelMessageOutput `json:"messages"`
+}
+
+func (t *tools) getChannelMessages(ctx context.Context, in getChannelMessagesInput) (getChannelMessagesOutput, error) {
+	channel := strings.TrimSpace(in.Channel)
+	if in.Before < 0 {
+		return getChannelMessagesOutput{}, errors.New("'before' must be a post id")
+	}
+	posts, err := t.ChannelMessages(ctx, t.account, channel, limitOr(in.Limit, 20, 100), in.Before)
+	if err != nil {
+		return getChannelMessagesOutput{}, err
+	}
+
+	out := getChannelMessagesOutput{Channel: channel, Messages: make([]channelMessageOutput, 0, len(posts))}
+	for _, p := range posts {
+		out.Messages = append(out.Messages, channelMessageOutput{
+			ID:        strconv.Itoa(p.ID),
+			Timestamp: p.Timestamp.Format(time.RFC3339),
+			Type:      p.Type,
+			Text:      p.Text,
+			HasMedia:  p.HasMedia,
+			Views:     p.Views,
+			Reactions: p.Reactions,
+		})
 	}
 	return out, nil
 }

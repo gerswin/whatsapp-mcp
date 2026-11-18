@@ -8,6 +8,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -22,6 +23,11 @@ func (m *Manager) captureMessage(client *whatsmeow.Client, account string, evt *
 		return
 	}
 	s := m.store
+
+	status := isStatus(evt.Info.Chat)
+	if status && !m.storeStatus {
+		return
+	}
 
 	// Edits and "delete for everyone" arrive as protocol messages that point at
 	// the original message instead of carrying a new one.
@@ -46,6 +52,10 @@ func (m *Manager) captureMessage(client *whatsmeow.Client, account string, evt *
 		return
 	}
 
+	if m.captureReaction(client, account, evt) || m.capturePollVote(client, account, evt) {
+		return
+	}
+
 	msg, ok := convert(client, evt)
 	if !ok {
 		return
@@ -55,7 +65,12 @@ func (m *Manager) captureMessage(client *whatsmeow.Client, account string, evt *
 		return
 	}
 
-	if evt.Info.IsGroup {
+	if status {
+		// Everyone's status updates share one chat; do not name it after a poster.
+		if s.ChatName(account, msg.ChatJID) == "" {
+			_ = s.SetChatName(account, msg.ChatJID, statusChatName)
+		}
+	} else if evt.Info.IsGroup {
 		if s.ChatName(account, msg.ChatJID) == "" && client != nil {
 			// Group names are not in the message; fetch once, off the event loop.
 			go m.fetchGroupName(client, account, evt.Info.Chat)
@@ -80,26 +95,16 @@ func (m *Manager) captureHistory(client *whatsmeow.Client, account string, evt *
 	total := 0
 	for _, conv := range evt.Data.GetConversations() {
 		chatJID, err := types.ParseJID(conv.GetID())
-		if err != nil {
+		if err != nil || (isStatus(chatJID) && !m.storeStatus) {
 			continue
 		}
 
-		var batch []store.Message
+		var webMsgs []*waWeb.WebMessageInfo
 		for _, hm := range conv.GetMessages() {
-			parsed, err := client.ParseWebMessage(chatJID, hm.GetMessage())
-			if err != nil || parsed == nil || parsed.Message == nil {
-				continue
-			}
-			if msg, ok := convert(client, parsed); ok {
-				batch = append(batch, msg)
-			}
+			webMsgs = append(webMsgs, hm.GetMessage())
 		}
+		batch := m.saveHistory(client, account, chatJID, webMsgs)
 		if len(batch) == 0 {
-			continue
-		}
-
-		if err := s.Save(account, batch...); err != nil {
-			m.log.Error("failed to save history", "account", account, "chat", chatJID.String(), "err", err)
 			continue
 		}
 		total += len(batch)
@@ -113,9 +118,45 @@ func (m *Manager) captureHistory(client *whatsmeow.Client, account string, evt *
 		}
 	}
 
+	if m.storeStatus {
+		if batch := m.saveHistory(client, account, types.StatusBroadcastJID, evt.Data.GetStatusV3Messages()); len(batch) > 0 {
+			total += len(batch)
+			_ = s.SetChatName(account, batch[0].ChatJID, statusChatName)
+		}
+	}
+
 	if total > 0 {
 		m.log.Info("saved messages from history sync", "account", account, "count", total)
 	}
+}
+
+// saveHistory stores the synced messages of one chat, with the reactions and
+// poll votes attached to them, and returns what was stored.
+func (m *Manager) saveHistory(client *whatsmeow.Client, account string, chatJID types.JID, webMsgs []*waWeb.WebMessageInfo) []store.Message {
+	var batch []store.Message
+	var sources []*waWeb.WebMessageInfo
+	for _, web := range webMsgs {
+		parsed, err := client.ParseWebMessage(chatJID, web)
+		if err != nil || parsed == nil || parsed.Message == nil {
+			continue
+		}
+		if msg, ok := convert(client, parsed); ok {
+			batch = append(batch, msg)
+			sources = append(sources, web)
+		}
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+
+	if err := m.store.Save(account, batch...); err != nil {
+		m.log.Error("failed to save history", "account", account, "chat", chatJID.String(), "err", err)
+		return nil
+	}
+	for i, msg := range batch {
+		m.captureHistoryExtras(client, account, msg, sources[i])
+	}
+	return batch
 }
 
 func (m *Manager) fetchGroupName(client *whatsmeow.Client, account string, group types.JID) {
@@ -154,14 +195,16 @@ func (m *Manager) recordSent(client *whatsmeow.Client, account string, chat type
 }
 
 // convert turns a WhatsApp message event into a storable Message. ok is false
-// for things we do not keep: status broadcasts, channels, reactions, poll
-// votes and other content-less protocol traffic.
+// for things that are not messages of a chat: broadcast lists, channels (read
+// on demand, see ChannelMessages), reactions and poll votes (stored on their
+// own) and other content-less protocol traffic. Status updates are converted;
+// whether they are kept is the caller's decision.
 func convert(client *whatsmeow.Client, evt *events.Message) (store.Message, bool) {
 	info := &evt.Info
 	if info.ID == "" {
 		return store.Message{}, false
 	}
-	if info.Chat.Server == types.BroadcastServer || info.Chat.Server == types.NewsletterServer {
+	if (info.Chat.Server == types.BroadcastServer && !isStatus(info.Chat)) || info.Chat.Server == types.NewsletterServer {
 		return store.Message{}, false
 	}
 
@@ -181,16 +224,17 @@ func convert(client *whatsmeow.Client, evt *events.Message) (store.Message, bool
 	}
 
 	return store.Message{
-		ID:         info.ID,
-		ChatJID:    chat,
-		SenderJID:  resolveSender(client, info),
-		SenderName: info.PushName,
-		FromMe:     info.IsFromMe,
-		Type:       msgType,
-		Text:       text,
-		QuotedID:   quotedID(evt.Message),
-		Timestamp:  ts,
-		Media:      mediaRef(evt.Message),
+		ID:          info.ID,
+		ChatJID:     chat,
+		SenderJID:   resolveSender(client, info),
+		SenderName:  info.PushName,
+		FromMe:      info.IsFromMe,
+		Type:        msgType,
+		Text:        text,
+		QuotedID:    quotedID(evt.Message),
+		Timestamp:   ts,
+		Media:       mediaRef(evt.Message),
+		PollOptions: pollOptions(evt.Message),
 	}, true
 }
 
@@ -341,14 +385,18 @@ func describe(msg *waE2E.Message) (msgType, text string) {
 	}
 
 	if poll := pollCreation(msg); poll != nil {
-		var options []string
-		for _, o := range poll.GetOptions() {
-			options = append(options, o.GetOptionName())
-		}
-		return "poll", joinNonEmpty(" — ", poll.GetName(), strings.Join(options, " | "))
+		return "poll", joinNonEmpty(" — ", poll.GetName(), strings.Join(pollOptions(msg), " | "))
 	}
 
 	return "", ""
+}
+
+func pollOptions(msg *waE2E.Message) []string {
+	var options []string
+	for _, o := range pollCreation(msg).GetOptions() {
+		options = append(options, o.GetOptionName())
+	}
+	return options
 }
 
 func pollCreation(msg *waE2E.Message) *waE2E.PollCreationMessage {
