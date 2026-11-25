@@ -34,6 +34,11 @@ type Transcriber interface {
 	Transcribe(ctx context.Context, data []byte, mime string) (string, error)
 }
 
+// Speaker turns text into an Ogg/Opus recording (see internal/media.ElevenLabs).
+type Speaker interface {
+	Speak(ctx context.Context, text string) ([]byte, error)
+}
+
 type Options struct {
 	// DataDir holds whatsapp.db, the WhatsApp session database.
 	DataDir string
@@ -44,6 +49,8 @@ type Options struct {
 	// AutoMaxSeconds long, so they show up in history and search.
 	AutoTranscribe bool
 	AutoMaxSeconds int
+	// Speaker is nil when text-to-speech is not configured.
+	Speaker Speaker
 	// StoreStatus keeps contacts' status updates as a chat of their own.
 	StoreStatus bool
 	Log         *slog.Logger
@@ -56,6 +63,7 @@ type Manager struct {
 	transcriber    Transcriber
 	autoEnabled    bool
 	autoMaxSeconds int
+	speaker        Speaker
 	storeStatus    bool
 	log            *slog.Logger
 
@@ -113,6 +121,7 @@ func NewManager(ctx context.Context, opts Options) (*Manager, error) {
 		transcriber:    opts.Transcriber,
 		autoEnabled:    opts.AutoTranscribe && opts.Transcriber != nil,
 		autoMaxSeconds: opts.AutoMaxSeconds,
+		speaker:        opts.Speaker,
 		storeStatus:    opts.StoreStatus,
 		log:            opts.Log,
 		clients:        map[string]*whatsmeow.Client{},

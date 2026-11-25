@@ -29,6 +29,7 @@ const (
 type fakeBackend struct {
 	Backend
 	texts []sentText
+	voice []sentText
 }
 
 type sentText struct{ account, to, text, replyTo string }
@@ -54,6 +55,11 @@ func (*fakeBackend) ContactName(context.Context, string, string) string { return
 func (f *fakeBackend) SendText(_ context.Context, account, to, text, replyTo string) (wa.Sent, error) {
 	f.texts = append(f.texts, sentText{account, to, text, replyTo})
 	return wa.Sent{MessageID: "SENT1", Chat: alice, Timestamp: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}, nil
+}
+
+func (f *fakeBackend) SendVoiceNote(_ context.Context, account, to, text, replyTo string) (wa.Sent, error) {
+	f.voice = append(f.voice, sentText{account, to, text, replyTo})
+	return wa.Sent{MessageID: "VOICE1", Chat: alice, Timestamp: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}, nil
 }
 
 func (*fakeBackend) Media(_ context.Context, account, chat, id string) (*wa.Media, error) {
@@ -119,6 +125,7 @@ func startServer(t *testing.T, st *store.Store) (*httptest.Server, *fakeBackend)
 		OAuthDBPath:   filepath.Join(t.TempDir(), "oauth.db"),
 		Version:       "test",
 		Transcription: true,
+		VoiceNotes:    true,
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -294,6 +301,58 @@ func TestSendTextAndInputValidation(t *testing.T) {
 	}
 }
 
+func TestSendVoiceNote(t *testing.T) {
+	srv, backend := startServer(t, nil)
+	session := connect(t, srv, "apikey", tokenA)
+
+	var out sentOutput
+	call(t, session, "send_voice_note", map[string]any{"to": "5511911112222", "text": "  Llego en diez minutos  "}, &out)
+	if out.MessageID != "VOICE1" {
+		t.Fatalf("unexpected result: %+v", out)
+	}
+	if len(backend.voice) != 1 || backend.voice[0] != (sentText{"inst-a", "5511911112222", "Llego en diez minutos", ""}) {
+		t.Fatalf("unexpected SendVoiceNote calls: %+v", backend.voice)
+	}
+
+	// Blank or oversized text never reaches the paid text-to-speech call.
+	for _, text := range []string{"   ", strings.Repeat("a", 5001)} {
+		if res := call(t, session, "send_voice_note", map[string]any{"to": "5511911112222", "text": text}, nil); !res.IsError {
+			t.Fatalf("text of %d characters should be a tool error", len(text))
+		}
+	}
+	if len(backend.voice) != 1 {
+		t.Fatalf("invalid calls reached SendVoiceNote (%d calls)", len(backend.voice))
+	}
+}
+
+// Without text-to-speech configured the tool is not offered at all.
+func TestVoiceNotesAreOptIn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st, err := store.Open(filepath.Join(t.TempDir(), "empty.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	backend := &fakeBackend{}
+	r := gin.New()
+	if _, err := Register(r, Config{Backend: backend, Accounts: backend, Store: st, OAuthDBPath: filepath.Join(t.TempDir(), "oauth.db"), Version: "test"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	res, err := connect(t, srv, "apikey", tokenA).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name == "send_voice_note" {
+			t.Fatal("send_voice_note is offered without text-to-speech configured")
+		}
+	}
+}
+
 func TestGetMedia(t *testing.T) {
 	srv, _ := startServer(t, seededStore(t))
 	session := connect(t, srv, "apikey", tokenA)
@@ -343,7 +402,7 @@ func TestToolList(t *testing.T) {
 		"get_status", "list_chats", "get_messages", "search_messages", "get_media",
 		"list_contacts", "check_numbers", "list_groups", "get_group_info",
 		"list_channels", "get_channel_messages",
-		"send_text", "send_media", "send_location", "send_poll", "react_to_message", "mark_read",
+		"send_text", "send_media", "send_voice_note", "send_location", "send_poll", "react_to_message", "mark_read",
 	}
 	for _, name := range want {
 		if _, ok := tools[name]; !ok {

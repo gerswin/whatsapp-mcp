@@ -34,6 +34,7 @@ type Backend interface {
 	GroupInfo(ctx context.Context, account, group string) (*wa.GroupDetails, error)
 	SendText(ctx context.Context, account, to, text, replyTo string) (wa.Sent, error)
 	SendMedia(ctx context.Context, account string, req wa.MediaRequest) (wa.Sent, error)
+	SendVoiceNote(ctx context.Context, account, to, text, replyTo string) (wa.Sent, error)
 	SendLocation(ctx context.Context, account, to string, lat, lon float64, name, address string) (wa.Sent, error)
 	SendPoll(ctx context.Context, account, to, question string, options []string, maxAnswers int) (wa.Sent, error)
 	React(ctx context.Context, account, chat, messageID, emoji string, fromMe *bool) error
@@ -55,6 +56,8 @@ type Config struct {
 	Version   string
 	// Transcription tells the assistant whether audio can be transcribed.
 	Transcription bool
+	// VoiceNotes enables send_voice_note (text-to-speech is configured).
+	VoiceNotes bool
 	// StatusUpdates tells the assistant that status updates are being kept.
 	StatusUpdates bool
 }
@@ -151,6 +154,9 @@ func (e *endpoint) newServer(account string, schemas *mcp.SchemaCache) *mcp.Serv
 	} else {
 		instructions += ". Audio transcription is not configured on this server, so voice notes cannot be read."
 	}
+	if e.VoiceNotes {
+		instructions += " send_voice_note speaks a text with a synthetic voice and delivers it as a voice note; use it only when the user asks for a voice note or audio, not in place of a text message."
+	}
 	if e.StatusUpdates {
 		instructions += " Status updates posted by contacts are kept in the chat \"" + statusChat + "\"; they are not conversations and cannot be replied to from here."
 	}
@@ -165,7 +171,7 @@ func (e *endpoint) newServer(account string, schemas *mcp.SchemaCache) *mcp.Serv
 	})
 
 	t := &tools{Backend: e.Backend, store: e.Store, account: account}
-	t.register(server)
+	t.register(server, e.VoiceNotes)
 
 	return server
 }

@@ -7,13 +7,14 @@ Es un solo binario en Go sobre [whatsmeow](https://github.com/tulir/whatsmeow), 
 - **Varias cuentas** en el mismo servidor; cada conexión de un asistente ve solo una.
 - **Historial local**: guarda el texto de los mensajes para listarlos, leerlos y buscarlos.
 - **Imágenes**: el asistente puede abrir fotos y stickers y verlos.
+- **Notas de voz**: el asistente puede enviar notas de voz leídas con una voz de ElevenLabs (opcional).
 - **Audios**: transcripción con Whisper (o cualquier API compatible con OpenAI). Las notas de voz aparecen como texto en el historial y en la búsqueda.
 - **OAuth 2.1 integrado**, que es lo que piden los conectores de Claude.ai y ChatGPT.
 
 ## Puesta en marcha
 
 ```bash
-cp .env.example .env      # ajusta PUBLIC_URL y, si quieres audios, WHISPER_API_KEY
+cp .env.example .env      # ajusta PUBLIC_URL; opcional: WHISPER_API_KEY (leer audios) y ELEVENLABS_* (enviar notas de voz)
 docker compose up -d --build
 ```
 
@@ -81,6 +82,7 @@ ingress:
 | `get_channel_messages` | Publicaciones de un canal, consultadas a WhatsApp en el momento |
 | `send_text` | Envía texto, opcionalmente citando un mensaje |
 | `send_media` | Envía imagen, video, audio o documento desde una URL pública |
+| `send_voice_note` | Envía una nota de voz leyendo un texto con una voz de ElevenLabs (solo si está configurado) |
 | `send_location` | Envía una ubicación |
 | `send_poll` | Envía una encuesta |
 | `react_to_message` | Reacciona con un emoji |
@@ -97,6 +99,14 @@ Los archivos **no se guardan** en el servidor. De cada mensaje con archivo se gu
 
 La transcripción envía el audio al servicio configurado (por defecto, OpenAI). Si no quieres eso, deja `WHISPER_API_KEY` vacía o apunta `WHISPER_BASE_URL` a un servicio propio compatible.
 
+## Notas de voz
+
+Con `ELEVENLABS_API_KEY` y `ELEVENLABS_VOICE_ID` definidas aparece la tool `send_voice_note`: el asistente escribe el texto, ElevenLabs lo convierte en audio con esa voz y se entrega como nota de voz (Ogg/Opus). El texto queda en el historial como transcripción del mensaje enviado.
+
+- El voice ID se copia en ElevenLabs desde *Voices* → menú de la voz → *Copy voice ID*.
+- Cada nota admite hasta 5000 caracteres y consume créditos de la cuenta de ElevenLabs. El texto se envía a ese servicio.
+- Sin las dos variables la tool no se ofrece.
+
 ## Configuración
 
 | Variable | Por defecto | |
@@ -111,6 +121,9 @@ La transcripción envía el audio al servicio configurado (por defecto, OpenAI).
 | `WHISPER_LANGUAGE` | autodetectar | Pista de idioma, p. ej. `es` |
 | `WHISPER_AUTO` | `true` | Transcribir al llegar |
 | `WHISPER_MAX_SECONDS` | `600` | Duración máxima para la transcripción automática |
+| `ELEVENLABS_API_KEY` | vacío | Con `ELEVENLABS_VOICE_ID`, activa las notas de voz |
+| `ELEVENLABS_VOICE_ID` | vacío | Voz de ElevenLabs con la que se leen |
+| `ELEVENLABS_MODEL` | `eleven_multilingual_v2` | Modelo de texto a voz |
 | `STORE_STATUS` | `false` | Guarda los estados de tus contactos como un chat aparte |
 
 ## Qué se guarda y qué no

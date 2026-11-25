@@ -55,6 +55,9 @@ Configuration (environment):
   WHISPER_AUTO          transcribe incoming audio automatically (default true)
   STORE_STATUS          keep contacts' status updates as a chat (default false)
   WHISPER_MAX_SECONDS   longest audio to transcribe automatically (default 600)
+  ELEVENLABS_API_KEY    with ELEVENLABS_VOICE_ID, enables sending voice notes (text-to-speech)
+  ELEVENLABS_VOICE_ID   ElevenLabs voice the voice notes are spoken with
+  ELEVENLABS_MODEL      text-to-speech model (default eleven_multilingual_v2)
 `
 
 func main() {
@@ -127,6 +130,14 @@ func serve() error {
 		transcriber = media.NewWhisper(env("WHISPER_BASE_URL", ""), key, env("WHISPER_MODEL", ""), env("WHISPER_LANGUAGE", ""))
 	}
 	auto := transcriber != nil && !strings.EqualFold(env("WHISPER_AUTO", "true"), "false")
+	var speaker wa.Speaker
+	elevenKey, elevenVoice := env("ELEVENLABS_API_KEY", ""), env("ELEVENLABS_VOICE_ID", "")
+	if elevenKey != "" && elevenVoice != "" {
+		speaker = media.NewElevenLabs(env("ELEVENLABS_BASE_URL", ""), elevenKey, elevenVoice, env("ELEVENLABS_MODEL", ""))
+	} else if elevenKey != "" || elevenVoice != "" {
+		log.Warn("voice notes are off: both ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are needed")
+	}
+
 	storeStatus := strings.EqualFold(env("STORE_STATUS", "false"), "true")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -138,6 +149,7 @@ func serve() error {
 		Transcriber:    transcriber,
 		AutoTranscribe: auto,
 		AutoMaxSeconds: envInt("WHISPER_MAX_SECONDS", 600),
+		Speaker:        speaker,
 		StoreStatus:    storeStatus,
 		Log:            log,
 	})
@@ -163,6 +175,7 @@ func serve() error {
 		PublicURL:     env("PUBLIC_URL", ""),
 		Version:       version,
 		Transcription: transcriber != nil,
+		VoiceNotes:    speaker != nil,
 		StatusUpdates: storeStatus,
 	})
 	if err != nil {
@@ -206,7 +219,7 @@ func serve() error {
 			transcription = "automatic"
 		}
 	}
-	log.Info("wa-mcp is running", "version", version, "listen", addr, "mcp", mcpserver.Path, "data", dir, "transcription", transcription, "status_updates", storeStatus)
+	log.Info("wa-mcp is running", "version", version, "listen", addr, "mcp", mcpserver.Path, "data", dir, "transcription", transcription, "voice_notes", speaker != nil, "status_updates", storeStatus)
 
 	select {
 	case err := <-failed:

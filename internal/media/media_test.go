@@ -3,6 +3,8 @@ package media
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -97,5 +99,88 @@ func TestWhisperErrors(t *testing.T) {
 	}
 	if _, err := w.Transcribe(context.Background(), make([]byte, MaxTranscribeBytes+1), "audio/ogg"); err == nil {
 		t.Fatal("oversized audio should fail")
+	}
+}
+
+// oggOpus builds the two pages that matter of an Ogg/Opus file: the OpusHead
+// header with its pre-skip, and a last page with the final granule position.
+func oggOpus(preSkip uint16, granule uint64) []byte {
+	page := func(granule uint64, payload []byte) []byte {
+		p := append([]byte("OggS"), 0, 0)
+		p = binary.LittleEndian.AppendUint64(p, granule)
+		p = append(p, make([]byte, 12)...) // serial, sequence, checksum
+		p = append(p, 1, byte(len(payload)))
+		return append(p, payload...)
+	}
+	head := append([]byte("OpusHead"), 1, 1)
+	head = binary.LittleEndian.AppendUint16(head, preSkip)
+	head = append(head, make([]byte, 7)...)
+	return append(page(0, head), page(granule, []byte("frames"))...)
+}
+
+func TestElevenLabsSpeak(t *testing.T) {
+	audio := oggOpus(312, 48000*3+312)
+	var gotKey, gotPath, gotFormat string
+	var gotBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey, gotPath, gotFormat = r.Header.Get("xi-api-key"), r.URL.Path, r.URL.Query().Get("output_format")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write(audio)
+	}))
+	defer srv.Close()
+
+	e := NewElevenLabs(srv.URL+"/", "xi-test", "voice123", "")
+	out, err := e.Speak(context.Background(), "  hola, llego en diez minutos ")
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	if !bytes.Equal(out, audio) {
+		t.Fatal("the audio was not returned as received")
+	}
+	if gotKey != "xi-test" || gotPath != "/v1/text-to-speech/voice123" || gotFormat != "opus_48000_32" ||
+		gotBody["text"] != "hola, llego en diez minutos" || gotBody["model_id"] != "eleven_multilingual_v2" {
+		t.Fatalf("unexpected request: key=%q path=%q format=%q body=%v", gotKey, gotPath, gotFormat, gotBody)
+	}
+
+	if _, err := e.Speak(context.Background(), "   "); err == nil {
+		t.Fatal("blank text should fail")
+	}
+	if _, err := e.Speak(context.Background(), strings.Repeat("a", MaxSpeechChars+1)); err == nil {
+		t.Fatal("oversized text should fail")
+	}
+}
+
+func TestElevenLabsErrors(t *testing.T) {
+	status, body := http.StatusUnauthorized, `{"detail":{"status":"invalid_api_key","message":"Invalid API key"}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		io.WriteString(w, body)
+	}))
+	defer srv.Close()
+	e := NewElevenLabs(srv.URL, "bad", "voice123", "")
+
+	if _, err := e.Speak(context.Background(), "hola"); err == nil || !strings.Contains(err.Error(), "Invalid API key") {
+		t.Fatalf("expected the API error to surface, got %v", err)
+	}
+	status, body = http.StatusNotFound, `{"detail":"Voice not found"}`
+	if _, err := e.Speak(context.Background(), "hola"); err == nil || !strings.Contains(err.Error(), "Voice not found") {
+		t.Fatalf("expected the plain detail to surface, got %v", err)
+	}
+	// Anything WhatsApp would not play as a voice note is refused.
+	status, body = http.StatusOK, "ID3 this is an mp3"
+	if _, err := e.Speak(context.Background(), "hola"); err == nil || !strings.Contains(err.Error(), "Ogg/Opus") {
+		t.Fatalf("expected non-Opus audio to be refused, got %v", err)
+	}
+}
+
+func TestOggOpusSeconds(t *testing.T) {
+	if got := OggOpusSeconds(oggOpus(312, 48000*3+312)); got != 3 {
+		t.Fatalf("3 s file = %d", got)
+	}
+	if got := OggOpusSeconds(oggOpus(312, 48000*3+313)); got != 4 {
+		t.Fatalf("a partial second rounds up, got %d", got)
+	}
+	if got := OggOpusSeconds([]byte("not ogg")); got != 0 {
+		t.Fatalf("garbage = %d", got)
 	}
 }

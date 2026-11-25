@@ -189,6 +189,50 @@ func (m *Manager) SendMedia(ctx context.Context, account string, req MediaReques
 	return m.deliver(ctx, client, account, jid, msg)
 }
 
+// SendVoiceNote reads text aloud with the configured text-to-speech voice and
+// delivers the recording as a voice note. The text is kept as the transcript
+// of the sent message.
+func (m *Manager) SendVoiceNote(ctx context.Context, account, to, text, replyTo string) (Sent, error) {
+	if m.speaker == nil {
+		return Sent{}, errors.New("voice notes are not configured on this server (ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID)")
+	}
+	// Resolve the recipient first: a bad one must not cost a synthesis.
+	client, jid, err := m.target(account, to)
+	if err != nil {
+		return Sent{}, err
+	}
+
+	data, err := m.speaker.Speak(ctx, text)
+	if err != nil {
+		return Sent{}, err
+	}
+	up, err := client.Upload(ctx, data, whatsmeow.MediaAudio)
+	if err != nil {
+		return Sent{}, fmt.Errorf("upload to WhatsApp failed: %w", err)
+	}
+
+	audio := &waE2E.AudioMessage{
+		URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
+		FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
+		Mimetype: proto.String("audio/ogg; codecs=opus"), PTT: proto.Bool(true),
+	}
+	if seconds := media.OggOpusSeconds(data); seconds > 0 {
+		audio.Seconds = &seconds
+	}
+	if replyTo != "" {
+		audio.ContextInfo = m.quote(client, account, jid, replyTo)
+	}
+
+	sent, err := m.deliver(ctx, client, account, jid, &waE2E.Message{AudioMessage: audio})
+	if err != nil {
+		return Sent{}, err
+	}
+	if err := m.store.SetTranscript(account, sent.Chat, sent.MessageID, strings.TrimSpace(text)); err != nil {
+		m.log.Error("failed to store the text of a voice note", "account", account, "id", sent.MessageID, "err", err)
+	}
+	return sent, nil
+}
+
 func (m *Manager) SendLocation(ctx context.Context, account, to string, lat, lon float64, name, address string) (Sent, error) {
 	client, jid, err := m.target(account, to)
 	if err != nil {

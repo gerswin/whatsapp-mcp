@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/gerswin/whatsapp-mcp/internal/media"
 	"github.com/gerswin/whatsapp-mcp/internal/store"
 	"github.com/gerswin/whatsapp-mcp/internal/wa"
 )
@@ -22,7 +24,7 @@ type tools struct {
 	account string
 }
 
-func (t *tools) register(s *mcp.Server) {
+func (t *tools) register(s *mcp.Server, voiceNotes bool) {
 	addTool(s, "get_status", "Connection status",
 		"Report whether this WhatsApp account is connected and logged in, and which number it is.",
 		readOnly, t.getStatus)
@@ -63,6 +65,11 @@ func (t *tools) register(s *mcp.Server) {
 	addTool(s, "send_media", "Send media from URL",
 		"Send an image, video, audio or document that is available at a public URL.",
 		sends, t.sendMedia)
+	if voiceNotes {
+		addTool(s, "send_voice_note", "Send voice note",
+			"Speak a text with this server's synthetic voice and send it as a voice note to a person or group. Write the text the way it should be said aloud, in the recipient's language, without emojis, markdown or URLs.",
+			sends, t.sendVoiceNote)
+	}
 	addTool(s, "send_location", "Send location",
 		"Send a location pin to a person or group.",
 		sends, t.sendLocation)
@@ -703,6 +710,23 @@ func (t *tools) sendMedia(ctx context.Context, in sendMediaInput) (sentOutput, e
 		Caption:  in.Caption,
 		Filename: in.Filename,
 	}))
+}
+
+type sendVoiceNoteInput struct {
+	To      string `json:"to" jsonschema:"recipient phone number or JID"`
+	Text    string `json:"text" jsonschema:"what the voice note says (up to 5000 characters)"`
+	ReplyTo string `json:"reply_to,omitempty" jsonschema:"id of a message in that chat to quote"`
+}
+
+func (t *tools) sendVoiceNote(ctx context.Context, in sendVoiceNoteInput) (sentOutput, error) {
+	text := strings.TrimSpace(in.Text)
+	if text == "" {
+		return sentOutput{}, errors.New("text is required")
+	}
+	if n := len([]rune(text)); n > media.MaxSpeechChars {
+		return sentOutput{}, fmt.Errorf("text is too long for a voice note (%d characters, the limit is %d)", n, media.MaxSpeechChars)
+	}
+	return sent(t.SendVoiceNote(ctx, t.account, in.To, text, strings.TrimSpace(in.ReplyTo)))
 }
 
 type sendLocationInput struct {
